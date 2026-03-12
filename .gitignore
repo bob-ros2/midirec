@@ -1,0 +1,10 @@
+build/
+bin/
+*.mid
+*.o
+*.a
+*.so
+.vscode/
+.idea/
+CMakeSettings.json
+CMakeUserPresets.json
