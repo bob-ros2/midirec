@@ -19,6 +19,7 @@ if(NOT RTMIDI_FOUND)
         GIT_REPOSITORY https://github.com/thestk/rtmidi.git
         GIT_TAG        5.0.0 # Older version for better compatibility
     )
+    set(BUILD_SHARED_LIBS OFF) # Force static libs
     FetchContent_MakeAvailable(rtmidi)
     set(RTMIDI_LIBRARIES rtmidi)
     set(RTMIDI_INCLUDE_DIRS ${rtmidi_SOURCE_DIR})
