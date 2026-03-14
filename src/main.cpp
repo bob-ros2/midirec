@@ -3,249 +3,253 @@
 #include <string>
 #include <chrono>
 #include <thread>
-#include <atomic>
 #include <mutex>
+#include <atomic>
+#include <fstream>
 #include <iomanip>
+#include <ctime>
+#include <algorithm>
 #include <sstream>
-#include <filesystem>
-#include <RtMidi.h>
-#include <MidiFile.h>
+#include "RtMidi.h"
 
-// ANSI Colors for premium look
-#define RESET   "\033[0m"
-#define RED     "\033[31m"
-#define GREEN   "\033[32m"
-#define YELLOW  "\033[33m"
-#define BLUE    "\033[34m"
-#define MAGENTA "\033[35m"
-#define CYAN    "\033[36m"
-#define WHITE   "\033[37m"
-#define BOLD    "\033[1m"
+// Constants
+const int DEFAULT_PPQ = 480;
+const int DEFAULT_BPM = 120;
+const double DEFAULT_SILENCE_TIMEOUT = 10.0; // seconds
 
+// Global/Shared State
 struct MidiEvent {
-    double timestamp;
+    double deltaTime;
     std::vector<unsigned char> message;
 };
 
-class MidiRecorder {
-public:
-    MidiRecorder(int timeoutSec = 10) 
-        : m_timeoutSec(timeoutSec), m_isRecording(false), m_shouldStop(false) {
-        
-        try {
-            m_midiIn = std::make_unique<RtMidiIn>();
-        } catch (RtMidiError &error) {
-            error.printMessage();
-            exit(EXIT_FAILURE);
-        }
+std::vector<MidiEvent> g_buffer;
+std::mutex g_bufferMutex;
+std::atomic<bool> g_recording(false);
+std::atomic<double> g_lastMessageTime(0.0);
+std::atomic<bool> g_exit(false);
+double g_accumulatedDelta = 0.0; // Accessed only in the callback thread
+
+// Helper to write Variable Length Quantity (VLQ) for MIDI files
+void writeVLQ(std::ostream& out, uint32_t value) {
+    uint8_t bytes[4];
+    int count = 0;
+    bytes[count++] = static_cast<uint8_t>(value & 0x7F);
+    while (value >>= 7) {
+        bytes[count++] = static_cast<uint8_t>((value & 0x7F) | 0x80);
     }
-
-    void listDevices() {
-        unsigned int nPorts = m_midiIn->getPortCount();
-        std::cout << "\n" << YELLOW << BOLD << "Verfügbare MIDI-Eingänge (Total: " << nPorts << "):" << RESET << "\n";
-        for (unsigned int i = 0; i < nPorts; i++) {
-            try {
-                std::cout << "  [" << GREEN << i << RESET << "] " << WHITE << m_midiIn->getPortName(i) << RESET << "\n";
-            } catch (RtMidiError &error) {
-                error.printMessage();
-            }
-        }
-        std::cout << std::endl;
+    while (count > 0) {
+        out.put(static_cast<char>(bytes[--count]));
     }
-
-    bool openPort(int portIndex = -1) {
-        unsigned int nPorts = m_midiIn->getPortCount();
-        if (nPorts == 0) {
-            std::cerr << "Keine MIDI-Eingabegeräte gefunden!\n";
-            return false;
-        }
-
-        if (portIndex < 0) {
-            std::cout << "Automatisches Öffnen von Port 0: " << m_midiIn->getPortName(0) << "\n";
-            m_midiIn->openPort(0);
-        } else {
-            if (portIndex >= (int)nPorts) {
-                std::cerr << "Port-Index " << portIndex << " ist ungültig.\n";
-                return false;
-            }
-            std::cout << "Öffne Port " << portIndex << ": " << m_midiIn->getPortName(portIndex) << "\n";
-            m_midiIn->openPort(portIndex);
-        }
-
-        // Sysex, Timing und Active Sensing ignorieren (wie gewünscht)
-        m_midiIn->ignoreTypes(true, true, true);
-        
-        m_midiIn->setCallback(&MidiRecorder::midiCallback, this);
-        return true;
-    }
-
-    void run() {
-        std::cout << "\n" << CYAN << BOLD << ">>> Warte auf MIDI-Signale (Drücke eine Taste zum Starten)..." << RESET << std::endl;
-        
-        while (!m_shouldStop) {
-            auto now = std::chrono::steady_clock::now();
-            
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_isRecording) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastEventTime).count();
-                if (elapsed >= m_timeoutSec) {
-                    stopAndSave();
-                    std::cout << "\n" << CYAN << BOLD << ">>> Warte erneut auf MIDI-Signale..." << RESET << std::endl;
-                }
-            }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-
-    void stop() {
-        m_shouldStop = true;
-    }
-
-private:
-    static void midiCallback(double deltatime, std::vector<unsigned char> *message, void *userData) {
-        MidiRecorder* recorder = static_cast<MidiRecorder*>(userData);
-        recorder->handleMessage(deltatime, *message);
-    }
-
-    void handleMessage(double deltatime, const std::vector<unsigned char>& message) {
-        if (message.empty()) return;
-
-        unsigned char status = message[0];
-        unsigned char type = status & 0xF0;
-
-        // Trigger: Note On (und Velocity > 0)
-        if (!m_isRecording && type == 0x90 && message.size() > 2 && message[2] > 0) {
-            startRecording();
-        }
-
-        if (m_isRecording) {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_lastEventTime = std::chrono::steady_clock::now();
-            
-            // Absolute Zeit berechnen (MidiFile braucht Ticks oder Sekunden)
-            if (m_sessionEvents.empty()) {
-                m_sessionStartTime = std::chrono::steady_clock::now();
-                m_currentAbsoluteTime = 0.0;
-            } else {
-                m_currentAbsoluteTime += deltatime;
-            }
-            
-            m_sessionEvents.push_back({m_currentAbsoluteTime, message});
-            
-            // Kurzes Feedback in der Konsole
-            std::cout << "." << std::flush;
-        }
-    }
-
-    void startRecording() {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_isRecording = true;
-        m_sessionEvents.clear();
-        m_currentAbsoluteTime = 0.0;
-        m_lastEventTime = std::chrono::steady_clock::now();
-        
-        std::cout << "\n" << RED << BOLD << "[REC] Aufnahme gestartet! (" << getTimestampString() << ")" << RESET << "\n Recording: " << std::flush;
-    }
-
-    void stopAndSave() {
-        m_isRecording = false;
-        
-        if (m_sessionEvents.empty()) return;
-
-        std::string filename = getTimestampString() + "_record.mid";
-        std::cout << "\n" << GREEN << BOLD << "[SAVE] Aufnahme beendet. Datei: " << filename << " (" << m_sessionEvents.size() << " Events)" << RESET << std::endl;
-        
-        saveToFile(filename);
-        m_sessionEvents.clear();
-    }
-
-    void saveToFile(const std::string& filename) {
-        smf::MidiFile midifile;
-        midifile.addTrack(1);
-        int tpq = 480;
-        midifile.setTPQ(tpq); // Ticks per quarter note
-
-        // 120 BPM -> 2 Quarters per second -> 2 * TPQ ticks per second
-        double ticksPerSecond = 2.0 * tpq;
-
-        for (const auto& ev : m_sessionEvents) {
-            int track = 0;
-            int tick = static_cast<int>(ev.timestamp * ticksPerSecond);
-            std::vector<unsigned char> messageCopy = ev.message;
-            midifile.addEvent(track, tick, messageCopy);
-        }
-
-        midifile.sortTracks();
-        midifile.write(filename);
-    }
-
-    std::string getTimestampString() {
-        auto now = std::chrono::system_clock::now();
-        auto in_time_t = std::chrono::system_clock::to_time_t(now);
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&in_time_t), "%Y%m%d_%H%M%S");
-        return ss.str();
-    }
-
-    std::unique_ptr<RtMidiIn> m_midiIn;
-    int m_timeoutSec;
-    std::atomic<bool> m_isRecording;
-    std::atomic<bool> m_shouldStop;
-    
-    std::mutex m_mutex;
-    std::chrono::steady_clock::time_point m_lastEventTime;
-    std::chrono::steady_clock::time_point m_sessionStartTime;
-    double m_currentAbsoluteTime;
-    std::vector<MidiEvent> m_sessionEvents;
-};
-
-void printHelp() {
-    std::cout << "MidiRec - Ein einfacher Konsolen MIDI-Recorder\n\n"
-              << "Benutzung:\n"
-              << "  midirec [Optionen]\n\n"
-              << "Optionen:\n"
-              << "  -l, --list        Listet alle verfügbaren MIDI-Eingabegeräte auf\n"
-              << "  -i, --index <id>  Verwendet das Gerät mit dem angegebenen Index (Standard: 0)\n"
-              << "  -t, --timeout <s> Inaktivitäts-Zeitraum in Sekunden bis zum Speichern (Standard: 10)\n"
-              << "  -h, --help        Zeigt diese Hilfe an\n"
-              << std::endl;
 }
 
-int main(int argc, char** argv) {
-    int portIndex = -1;
-    int timeout = 10;
+// Helper to write big-endian values
+void writeBE(std::ostream& out, uint32_t value, int bytes) {
+    for (int i = bytes - 1; i >= 0; --i) {
+        out.put(static_cast<char>((value >> (i * 8)) & 0xFF));
+    }
+}
 
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") {
-            printHelp();
-            return 0;
-        } else if (arg == "-l" || arg == "--list") {
-            MidiRecorder recorder;
-            recorder.listDevices();
-            return 0;
-        } else if (arg == "-i" || arg == "--index") {
-            if (i + 1 < argc) {
-                portIndex = std::stoi(argv[++i]);
-            }
-        } else if (arg == "-t" || arg == "--timeout") {
-            if (i + 1 < argc) {
-                timeout = std::stoi(argv[++i]);
-            }
+void saveMidiFile(const std::vector<MidiEvent>& events, int bpm, int ppq) {
+    if (events.empty()) return;
+
+    // Generate filename: YYYYMMDD_HH24MISS_record.mid
+    auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm tm_struct;
+    localtime_s(&tm_struct, &now);
+    std::stringstream ss;
+    ss << std::put_time(&tm_struct, "%Y%m%d_%H%M%S") << "_record.mid";
+    std::string filename = ss.str();
+
+    std::ofstream out(filename, std::ios::binary);
+    if (!out) {
+        std::cerr << "Error: Could not open file for writing: " << filename << std::endl;
+        return;
+    }
+
+    // MThd Header
+    out.write("MThd", 4);
+    writeBE(out, 6, 4); // length
+    writeBE(out, 0, 2); // format 0 (single track)
+    writeBE(out, 1, 2); // number of tracks
+    writeBE(out, ppq, 2); // ticks per quarter note
+
+    // MTrk Header (we need to buffer track content to calculate length)
+    std::stringstream trackData;
+
+    // Set Tempo: 500,000 microseconds per quarter note = 120 BPM
+    uint32_t microsecondsPerQuarter = 60000000 / bpm;
+    trackData.put(0x00); // delta 0
+    trackData.put(static_cast<char>(0xFF));
+    trackData.put(0x51);
+    trackData.put(0x03);
+    writeBE(trackData, microsecondsPerQuarter, 3);
+
+    // Set Time Signature: 4/4
+    // FF 58 04 nn dd cc bb
+    // nn: numerator (4)
+    // dd: denominator power (2^2 = 4)
+    // cc: clocks per click (24)
+    // bb: 32nd notes per 24 clocks (8)
+    trackData.put(0x00); // delta 0
+    trackData.put(static_cast<char>(0xFF));
+    trackData.put(0x58);
+    trackData.put(0x04);
+    trackData.put(0x04); // 4
+    trackData.put(0x02); // /4
+    trackData.put(0x18); // 24
+    trackData.put(0x08); // 8
+
+    // Delta time calculation:
+    // RtMidi provides delta time in seconds.
+    // Ticks = DeltaSeconds * (BPM / 60) * PPQ
+    double ticksPerSecond = (static_cast<double>(bpm) / 60.0) * static_cast<double>(ppq);
+
+    for (const auto& ev : events) {
+        uint32_t deltaTicks = static_cast<uint32_t>(ev.deltaTime * ticksPerSecond + 0.5);
+        writeVLQ(trackData, deltaTicks);
+        for (unsigned char b : ev.message) {
+            trackData.put(static_cast<char>(b));
         }
     }
 
-    std::cout << MAGENTA << BOLD << "========================================" << RESET << "\n";
-    std::cout << MAGENTA << BOLD << "         MidiRec v1.0.0                 " << RESET << "\n";
-    std::cout << MAGENTA << BOLD << "========================================" << RESET << "\n";
-    
-    MidiRecorder recorder(timeout);
-    if (!recorder.openPort(portIndex)) {
-        return EXIT_FAILURE;
+    // End of Track
+    trackData.put(0x00); // delta 0
+    trackData.put(static_cast<char>(0xFF));
+    trackData.put(0x2F);
+    trackData.put(0x00);
+
+    std::string data = trackData.str();
+    out.write("MTrk", 4);
+    writeBE(out, static_cast<uint32_t>(data.size()), 4);
+    out.write(data.data(), data.size());
+
+    std::cout << "Saved: " << filename << " (" << events.size() << " events)" << std::endl;
+}
+
+void midiCallback(double deltatime, std::vector<unsigned char>* message, void* userData) {
+    if (!message || message->empty()) return;
+
+    g_accumulatedDelta += deltatime;
+
+    // Ignore Active Sensing (0xFE) and Clock (0xF8)
+    if (message->at(0) == 0xFE || message->at(0) == 0xF8) return;
+
+    // Capture the accumulated delta for this message
+    double deltaToRecord = g_accumulatedDelta;
+    g_accumulatedDelta = 0.0;
+
+    double currentTime = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    g_lastMessageTime = currentTime;
+
+    if (!g_recording) {
+        std::cout << "Input detected! Starting recording..." << std::endl;
+        g_recording = true;
+        std::lock_guard<std::mutex> lock(g_bufferMutex);
+        g_buffer.clear();
+        g_buffer.push_back({ 0.0, *message }); // First message always gets delta 0
+    }
+    else {
+        std::lock_guard<std::mutex> lock(g_bufferMutex);
+        g_buffer.push_back({ deltaToRecord, *message });
+    }
+}
+
+void listDevices(RtMidiIn& midiIn) {
+    unsigned int nPorts = midiIn.getPortCount();
+    std::cout << "\nAvailable MIDI input ports:\n";
+    for (unsigned int i = 0; i < nPorts; i++) {
+        std::cout << "  [" << i << "] " << midiIn.getPortName(i) << std::endl;
+    }
+    std::cout << std::endl;
+}
+
+void printUsage() {
+    std::cout << "Usage: midirec [options]\n"
+        << "Options:\n"
+        << "  --list           List available MIDI devices\n"
+        << "  --port <idx>     Specify MIDI port index (default: 0)\n"
+        << "  --timeout <sec>  Silence timeout in seconds (default: 10)\n"
+        << "  --bpm <val>      BPM for the output file (default: 120)\n"
+        << "  --help           Show this help\n";
+}
+
+int main(int argc, char* argv[]) {
+    unsigned int portIndex = 0;
+    double silenceTimeout = DEFAULT_SILENCE_TIMEOUT;
+    int bpm = DEFAULT_BPM;
+    bool portSpecified = false;
+
+    RtMidiIn midiIn;
+
+    // Parse arguments
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--list") {
+            listDevices(midiIn);
+            return 0;
+        }
+        else if (arg == "--port" && i + 1 < argc) {
+            portIndex = std::stoi(argv[++i]);
+            portSpecified = true;
+        }
+        else if (arg == "--timeout" && i + 1 < argc) {
+            silenceTimeout = std::stod(argv[++i]);
+        }
+        else if (arg == "--bpm" && i + 1 < argc) {
+            bpm = std::stoi(argv[++i]);
+        }
+        else if (arg == "--help") {
+            printUsage();
+            return 0;
+        }
     }
 
-    recorder.run();
+    if (midiIn.getPortCount() == 0) {
+        std::cerr << "Error: No MIDI input sources found." << std::endl;
+        return 1;
+    }
+
+    if (portIndex >= midiIn.getPortCount()) {
+        std::cerr << "Error: Port index " << portIndex << " out of range." << std::endl;
+        listDevices(midiIn);
+        return 1;
+    }
+
+    try {
+        midiIn.openPort(portIndex);
+        midiIn.setCallback(&midiCallback);
+        midiIn.ignoreTypes(false, false, false); // Don't ignore sysEx, time, sensing
+    }
+    catch (RtMidiError& error) {
+        std::cerr << "Error: " << error.getMessage() << std::endl;
+        return 1;
+    }
+
+    std::cout << "Monitoring " << midiIn.getPortName(portIndex) << "..." << std::endl;
+    std::cout << "Press Ctrl+C to exit. Recording starts on first message." << std::endl;
+
+    while (!g_exit) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        if (g_recording) {
+            double currentTime = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (currentTime - g_lastMessageTime > silenceTimeout) {
+                std::cout << "Silence detected (" << silenceTimeout << "s). Saving track..." << std::endl;
+
+                std::vector<MidiEvent> toSave;
+                {
+                    std::lock_guard<std::mutex> lock(g_bufferMutex);
+                    toSave = std::move(g_buffer);
+                    g_buffer.clear();
+                    g_recording = false;
+                }
+
+                saveMidiFile(toSave, bpm, DEFAULT_PPQ);
+                std::cout << "Reset. Waiting for next input..." << std::endl;
+            }
+        }
+    }
 
     return 0;
 }
