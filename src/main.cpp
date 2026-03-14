@@ -76,7 +76,7 @@ void saveMidiFile(const std::vector<MidiEvent>& events, int bpm, int ppq) {
 
     // MTrk Header (we need to buffer track content to calculate length)
     std::stringstream trackData;
-
+    
     // Set Tempo: 500,000 microseconds per quarter note = 120 BPM
     uint32_t microsecondsPerQuarter = 60000000 / bpm;
     trackData.put(0x00); // delta 0
@@ -147,11 +147,10 @@ void midiCallback(double deltatime, std::vector<unsigned char>* message, void* u
         g_recording = true;
         std::lock_guard<std::mutex> lock(g_bufferMutex);
         g_buffer.clear();
-        g_buffer.push_back({ 0.0, *message }); // First message always gets delta 0
-    }
-    else {
+        g_buffer.push_back({0.0, *message}); // First message always gets delta 0
+    } else {
         std::lock_guard<std::mutex> lock(g_bufferMutex);
-        g_buffer.push_back({ deltaToRecord, *message });
+        g_buffer.push_back({deltaToRecord, *message});
     }
 }
 
@@ -166,12 +165,12 @@ void listDevices(RtMidiIn& midiIn) {
 
 void printUsage() {
     std::cout << "Usage: midirec [options]\n"
-        << "Options:\n"
-        << "  --list           List available MIDI devices\n"
-        << "  --port <idx>     Specify MIDI port index (default: 0)\n"
-        << "  --timeout <sec>  Silence timeout in seconds (default: 10)\n"
-        << "  --bpm <val>      BPM for the output file (default: 120)\n"
-        << "  --help           Show this help\n";
+              << "Options:\n"
+              << "  -l, --list           Zeigt alle verfügbaren MIDI-Eingabegeräte an\n"
+              << "  -i, --index <id>     Wählt ein spezifisches Gerät über den Index aus (Standard: 0)\n"
+              << "  -t, --timeout <s>    Setzt die Inaktivitätszeit in Sekunden (Standard: 10)\n"
+              << "  --bpm <val>          BPM für das Ausgabeformat (Standard: 120)\n"
+              << "  -h, --help           Zeigt diese Hilfe an\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -185,21 +184,17 @@ int main(int argc, char* argv[]) {
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--list") {
+        if (arg == "-l" || arg == "--list") {
             listDevices(midiIn);
             return 0;
-        }
-        else if (arg == "--port" && i + 1 < argc) {
+        } else if ((arg == "-i" || arg == "--index" || arg == "--port") && i + 1 < argc) {
             portIndex = std::stoi(argv[++i]);
             portSpecified = true;
-        }
-        else if (arg == "--timeout" && i + 1 < argc) {
+        } else if ((arg == "-t" || arg == "--timeout") && i + 1 < argc) {
             silenceTimeout = std::stod(argv[++i]);
-        }
-        else if (arg == "--bpm" && i + 1 < argc) {
+        } else if (arg == "--bpm" && i + 1 < argc) {
             bpm = std::stoi(argv[++i]);
-        }
-        else if (arg == "--help") {
+        } else if (arg == "-h" || arg == "--help") {
             printUsage();
             return 0;
         }
@@ -220,8 +215,7 @@ int main(int argc, char* argv[]) {
         midiIn.openPort(portIndex);
         midiIn.setCallback(&midiCallback);
         midiIn.ignoreTypes(false, false, false); // Don't ignore sysEx, time, sensing
-    }
-    catch (RtMidiError& error) {
+    } catch (RtMidiError& error) {
         std::cerr << "Error: " << error.getMessage() << std::endl;
         return 1;
     }
@@ -236,7 +230,7 @@ int main(int argc, char* argv[]) {
             double currentTime = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
             if (currentTime - g_lastMessageTime > silenceTimeout) {
                 std::cout << "Silence detected (" << silenceTimeout << "s). Saving track..." << std::endl;
-
+                
                 std::vector<MidiEvent> toSave;
                 {
                     std::lock_guard<std::mutex> lock(g_bufferMutex);
@@ -244,7 +238,7 @@ int main(int argc, char* argv[]) {
                     g_buffer.clear();
                     g_recording = false;
                 }
-
+                
                 saveMidiFile(toSave, bpm, DEFAULT_PPQ);
                 std::cout << "Reset. Waiting for next input..." << std::endl;
             }
